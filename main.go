@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
+	"image/gif"
 	"image/jpeg"
+	"image/png"
 	"io"
 	"log"
 	"net/http"
@@ -14,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/disintegration/imaging"
+	"golang.org/x/image/webp"
 
 	tf "github.com/galeone/tensorflow/tensorflow/go"
 	tg "github.com/galeone/tfgo"
@@ -52,11 +55,12 @@ func imageHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Fatalf("unable to read image: %v", err)
 	}
+
 	defer imageFile.Close()
 
 	print(header.Filename)
 
-	normalizedImg, err := createTensor(imageFile)
+	normalizedImg, err := createTensor(imageFile, header.Filename)
 	if err != nil {
 		log.Fatalf("unable to make a normalizedImg from image: %v", err)
 	}
@@ -102,12 +106,31 @@ func loadLabels(path string) error {
 	return nil
 }
 
-func createTensor(image io.ReadCloser) (*tf.Tensor, error) {
-	srcImage, err := jpeg.Decode(image)
-	if err != nil {
-		log.Fatalf("unable to decode image: %v", err)
+func createTensor(src io.ReadCloser, fileName string) (*tf.Tensor, error) {
+	var srcImage image.Image
+	var err error
+
+	split := strings.Split(fileName, ".")
+	ext := strings.ToLower(split[len(split)-1])
+	switch ext {
+	case "png":
+		srcImage, err = png.Decode(src)
+	case "jpg", "jpeg":
+		srcImage, err = jpeg.Decode(src)
+	case "gif":
+		srcImage, err = gif.Decode(src)
+	case "webp":
+		srcImage, err = webp.Decode(src)
+	default:
+		return nil, fmt.Errorf("unsupported image extension %s", ext)
 	}
+
+	if err != nil {
+		return nil, err
+	}
+
 	img := imaging.Fill(srcImage, 224, 224, imaging.Center, imaging.Lanczos)
+
 	return imageToTensor(img, 224, 224)
 }
 
@@ -127,6 +150,7 @@ func imageToTensor(img image.Image, imageHeight, imageWidth int) (tfTensor *tf.T
 	for j := 0; j < imageHeight; j++ {
 		tfImage[0] = append(tfImage[0], make([][3]float32, imageWidth))
 	}
+
 	for i := 0; i < imageWidth; i++ {
 		for j := 0; j < imageHeight; j++ {
 			r, g, b, _ := img.At(i, j).RGBA()
@@ -135,6 +159,7 @@ func imageToTensor(img image.Image, imageHeight, imageWidth int) (tfTensor *tf.T
 			tfImage[0][j][i][2] = convertValue(b)
 		}
 	}
+
 	return tf.NewTensor(tfImage)
 }
 
