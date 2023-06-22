@@ -3,7 +3,7 @@ FROM golang:1.20.5-bullseye
 WORKDIR /app
 
 RUN apt-get update; \
-    apt-get install -y python3 python3-pip; \
+    apt-get install -y python3 python3-pip ffmpeg; \
     pip install tensorflow
 
 RUN wget https://storage.googleapis.com/tensorflow/libtensorflow/libtensorflow-cpu-linux-x86_64-2.6.0.tar.gz; \
