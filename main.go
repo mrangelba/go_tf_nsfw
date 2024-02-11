@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -10,41 +9,38 @@ import (
 	"image/png"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
-	"os/exec"
 	"runtime/debug"
 	"strings"
 
-	"github.com/disintegration/imaging"
-	uuid "github.com/google/uuid"
-	"golang.org/x/image/webp"
-
 	tf "github.com/galeone/tensorflow/tensorflow/go"
 	tg "github.com/galeone/tfgo"
+	"golang.org/x/image/webp"
+
+	"github.com/nfnt/resize"
 )
 
 var (
-	model  *tg.Model
-	labels []string
+	model *tg.Model
 )
 
 type classification struct {
-	Label       string  `json:"label"`
-	Probability float32 `json:"probability"`
-	Max         float32 `json:"max,omitempty"`
+	Drawings float32 `json:"drawings"`
+	Hentai   float32 `json:"hentai"`
+	Neutral  float32 `json:"neutral"`
+	Porn     float32 `json:"porn"`
+	Sexy     float32 `json:"sexy"`
 }
 
 func main() {
 	os.Setenv("TF_CPP_MIN_LOG_LEVEL", "2")
 
-	modelName := "./mobilenet_v2_140_224"
-	loadLabels(modelName)
-	model = tg.LoadModel(modelName, []string{"serve"}, nil)
+	model = tg.ImportModel("./inception_v3/nsfw.299x299.pb", "", nil)
 
 	log.Println("Run server ....")
-	http.HandleFunc("/image", imageHandler)
-	http.HandleFunc("/video", videoHandler)
+	http.HandleFunc("/image", image2Handler)
 
 	err := http.ListenAndServe(":8080", nil)
 
@@ -53,113 +49,7 @@ func main() {
 	}
 }
 
-func videoHandler(w http.ResponseWriter, r *http.Request) {
-	videoFile, header, err := r.FormFile("video")
-	if err != nil {
-		log.Printf("unable to read video: %v", err)
-
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte("400 - Bad Request"))
-		w.Write([]byte(err.Error()))
-	}
-
-	defer videoFile.Close()
-
-	print(header.Filename)
-
-	split := strings.Split(header.Filename, ".")
-	ext := strings.ToLower(split[len(split)-1])
-
-	uid := uuid.New().String()
-
-	filename := uid + "." + ext
-	dst, err := os.Create(filename)
-	if err != nil {
-		log.Println("error creating file", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	defer dst.Close()
-	if _, err := io.Copy(dst, videoFile); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	classifications, err := classifyVideo(filename, uid)
-
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-	}
-
-	for _, c := range classifications {
-		log.Printf("%s (%0.2f%%)\n", c.Label, c.Probability*100)
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(classifications)
-}
-
-func classifyVideo(filename string, uid string) ([]classification, error) {
-	extractFrames(filename, uid)
-
-	files, err := os.ReadDir(uid)
-	if err != nil {
-		log.Printf("unable to read images: %v", err)
-
-		return nil, err
-	}
-
-	classifications := [][]classification{}
-
-	for _, file := range files {
-		if !file.IsDir() {
-			f, err := os.Open(uid + "/" + file.Name())
-			if err != nil {
-				log.Printf("unable to read image: %v", err)
-
-				return nil, err
-			}
-
-			defer f.Close()
-
-			classification, err := modelExec(f, file.Name())
-			if err != nil {
-				log.Printf("unable to make a prediction: %v", err)
-
-				return nil, err
-			}
-
-			classifications = append(classifications, classification)
-		}
-	}
-
-	os.RemoveAll(uid)
-	avg := map[string]float32{}
-	max := map[string]float32{}
-
-	for _, r := range classifications {
-		for _, c := range r {
-			avg[c.Label] += c.Probability
-
-			if max[c.Label] < c.Probability {
-				max[c.Label] = c.Probability
-			}
-		}
-	}
-
-	result := []classification{}
-	for k, v := range avg {
-		result = append(result, classification{
-			Label:       k,
-			Probability: v / float32(len(classifications)),
-			Max:         max[k],
-		})
-	}
-	return result, nil
-}
-
-func imageHandler(w http.ResponseWriter, r *http.Request) {
+func image2Handler(w http.ResponseWriter, r *http.Request) {
 	// Read image
 	imageFile, header, err := r.FormFile("image")
 	if err != nil {
@@ -174,22 +64,20 @@ func imageHandler(w http.ResponseWriter, r *http.Request) {
 
 	print(header.Filename)
 
-	classifications, err := modelExec(imageFile, header.Filename)
+	classifications, err := modelExecInception(imageFile, header.Filename)
 	if err != nil {
 		log.Printf("unable to make a prediction: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 	}
 
-	for _, c := range classifications {
-		log.Printf("%s (%0.2f%%)\n", c.Label, c.Probability*100)
-	}
+	log.Println(classifications)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(classifications)
 }
 
-func modelExec(imageFile io.ReadCloser, filename string) ([]classification, error) {
-	normalizedImg, err := createTensor(imageFile, filename)
+func modelExecInception(imageFile io.ReadCloser, filename string) (*classification, error) {
+	normalizedImg, err := createTensor(imageFile, filename, 299, 299)
 	if err != nil {
 		log.Printf("unable to make a normalizedImg from image: %v", err)
 		return nil, err
@@ -197,44 +85,35 @@ func modelExec(imageFile io.ReadCloser, filename string) ([]classification, erro
 
 	results := model.Exec(
 		[]tf.Output{
-			model.Op("StatefulPartitionedCall", 0),
+			model.Op("dense_3/Softmax", 0),
 		}, map[tf.Output]*tf.Tensor{
-			model.Op("serving_default_input", 0): normalizedImg,
+			model.Op("input_1", 0): normalizedImg,
 		},
 	)
 
 	probabilities := results[0].Value().([][]float32)[0]
-	classifications := []classification{}
-	for i, p := range probabilities {
-		classifications = append(classifications, classification{
-			Label:       strings.ToLower(labels[i]),
-			Probability: p,
-		})
+
+	classifications := classification{
+		Drawings: float32(toFixed(float64(probabilities[0]), 4)),
+		Hentai:   float32(toFixed(float64(probabilities[1]), 4)),
+		Neutral:  float32(toFixed(float64(probabilities[2]), 4)),
+		Porn:     float32(toFixed(float64(probabilities[3]), 4)),
+		Sexy:     float32(toFixed(float64(probabilities[4]), 4)),
 	}
 
-	return classifications, nil
+	return &classifications, nil
 }
 
-func loadLabels(path string) error {
-	modelLabels := path + "/labels.txt"
-	f, err := os.Open(modelLabels)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		labels = append(labels, scanner.Text())
-	}
-
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-
-	return nil
+func round(num float64) int {
+	return int(num + math.Copysign(0.5, num))
 }
 
-func createTensor(src io.ReadCloser, fileName string) (*tf.Tensor, error) {
+func toFixed(num float64, precision int) float64 {
+	output := math.Pow(10, float64(precision))
+	return float64(round(num*output)) / output
+}
+
+func createTensor(src io.ReadCloser, fileName string, imageHeight, imageWidth int) (*tf.Tensor, error) {
 	var srcImage image.Image
 	var err error
 
@@ -249,6 +128,7 @@ func createTensor(src io.ReadCloser, fileName string) (*tf.Tensor, error) {
 		srcImage, err = gif.Decode(src)
 	case "webp":
 		srcImage, err = webp.Decode(src)
+
 	default:
 		return nil, fmt.Errorf("unsupported image extension %s", ext)
 	}
@@ -257,9 +137,9 @@ func createTensor(src io.ReadCloser, fileName string) (*tf.Tensor, error) {
 		return nil, err
 	}
 
-	img := imaging.Fill(srcImage, 224, 224, imaging.Center, imaging.Lanczos)
+	img := resize.Resize(uint(imageWidth), uint(imageHeight), srcImage, resize.Bilinear)
 
-	return imageToTensor(img, 224, 224)
+	return imageToTensor(img, imageHeight, imageWidth)
 }
 
 func imageToTensor(img image.Image, imageHeight, imageWidth int) (tfTensor *tf.Tensor, err error) {
@@ -293,39 +173,4 @@ func imageToTensor(img image.Image, imageHeight, imageWidth int) (tfTensor *tf.T
 
 func convertValue(value uint32) float32 {
 	return (float32(value >> 8)) / float32(255)
-}
-
-func extractFrames(src string, dst string) error {
-	err := os.Mkdir(dst, 0755)
-	if err != nil {
-		log.Println("error creating folder", err)
-
-		return err
-	}
-
-	cmdArgs := []string{}
-	cmdArgs = append(cmdArgs, "-i")
-	cmdArgs = append(cmdArgs, src)
-	cmdArgs = append(cmdArgs, "-vf")
-	cmdArgs = append(cmdArgs, "fps=1")
-	cmdArgs = append(cmdArgs, dst+"/frame_%d.jpg")
-
-	log.Printf("ffmpeg %s", cmdArgs)
-	cmd := exec.Command("ffmpeg", cmdArgs...)
-
-	out, err := cmd.CombinedOutput()
-
-	if err != nil {
-		return err
-	}
-
-	printOutput(out)
-
-	return nil
-}
-
-func printOutput(out []byte) {
-	if len(out) > 0 {
-		log.Printf("Output: %s\n", string(out))
-	}
 }
