@@ -1,4 +1,4 @@
-FROM golang:1.20-bullseye AS build
+FROM golang:1.21-bullseye AS build
 ARG LIBTENSORFLOW_FILENAME=libtensorflow-cpu-linux-x86_64-2.15.0.tar.gz
 ARG LIBTENSORFLOW_URL=https://storage.googleapis.com/tensorflow/libtensorflow/${LIBTENSORFLOW_FILENAME}
 
